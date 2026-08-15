@@ -261,7 +261,7 @@ and wherefrom to load a julia package.
 """
 struct PkgLoadSpec
     path::String
-    julia_syntax_version::VersionNumber
+    julia_syntax_version::Union{VersionNumber, String}
 end
 
 struct LoadingCache
@@ -920,7 +920,7 @@ function project_file_ext_load_spec(project_file::String, ext::PkgId)
     if exts !== nothing
         if ext.name in keys(exts) && ext.uuid == uuid5(UUID(d["uuid"]::String), ext.name)
             # Syntax version of the main package applies to its extensions
-            return PkgLoadSpec(find_ext_path(p, ext.name), project_get_syntax_version(d))
+            return PkgLoadSpec(find_ext_path(p, ext.name), project_get_syntax_version(d, dirname(project_file)))
         end
     end
     return nothing
@@ -937,12 +937,21 @@ end
 
 const NON_VERSIONED_SYNTAX = v"1.13"
 
-function project_get_syntax_version(d::Dict)
+function project_get_syntax_version(d::Dict, project_root)
     # Syntax Evolution. First check syntax.julia_version entry
     sv = nothing
     ds = get(d, "syntax", nothing)
     if ds !== nothing
-        sv = VersionNumber(get(ds, "julia_version", nothing))
+        version_string = get(ds, "julia_version", nothing)
+        sv = try
+            VersionNumber(version_string)
+        catch ArgumentError
+            if project_root !== nothing && version_string isa String && !isabspath(version_string)
+                normpath(joinpath(project_root, version_string))
+            else
+                version_string
+            end
+        end
     end
     # If not found, default to minimum(compat["julia"])
     if sv === nothing
@@ -959,7 +968,7 @@ function project_get_syntax_version(d::Dict)
     # However, it avoids surprises from moving over scripts and REPL code to packages
     if sv === nothing
         sv = VERSION
-    elseif sv <= NON_VERSIONED_SYNTAX
+    elseif sv isa VersionNumber && sv <= NON_VERSIONED_SYNTAX
         # Syntax versioning was first introduced in Julia 1.14 - we do not support
         # going back to versions before syntax version 1.13.
         sv = NON_VERSIONED_SYNTAX
@@ -974,7 +983,7 @@ function project_file_load_spec(project_file::String, name::String)
     if entryfile === nothing
         entryfile = get(d, "entryfile", nothing)::Union{String, Nothing}
     end
-    sv = project_get_syntax_version(d)
+    sv = project_get_syntax_version(d, dirname(project_file))
     return PkgLoadSpec(entry_path(dirname(project_file), name, entryfile), sv)
 end
 
@@ -987,10 +996,44 @@ function workspace_manifest(project_file)
 end
 
 struct VersionedParse
-    ver::VersionNumber
+    ver::Union{VersionNumber, String}
+end
+
+const versioned_parse_hooks = Dict{String, Function}()
+
+function parser_hook_for_local_syntax_package(path::String)
+    path = abspath(path)
+    hook = @lock require_lock get(versioned_parse_hooks, path, nothing)
+    hook === nothing || return hook
+
+    isdir(path) || error("syntax.julia_version path does not exist: $path")
+    project_file = locate_project_file(path)
+    project_file === nothing && error("syntax.julia_version path has no Project.toml: $path")
+    d = parsed_toml(project_file)
+    pkg_name = get(d, "name", nothing)
+    pkg_name isa String || error("syntax.julia_version package at $path must define `name` in Project.toml")
+
+    pushfirst!(LOAD_PATH, project_file)
+    m = try
+        require(__toplevel__, Symbol(pkg_name))
+    finally
+        popfirst!(LOAD_PATH)
+    end
+
+    isdefined(m, :core_parser_hook) || error("syntax.julia_version package $pkg_name must define `core_parser_hook`")
+    hook = getproperty(m, :core_parser_hook)
+    hook isa Function || error("syntax.julia_version package $pkg_name has non-callable `core_parser_hook`")
+
+    @lock require_lock versioned_parse_hooks[path] = hook
+    return hook
 end
 
 function (vp::VersionedParse)(code, filename::String, lineno::Int, offset::Int, options::Symbol)
+    if vp.ver isa String
+        hook = parser_hook_for_local_syntax_package(vp.ver)
+        return invokelatest(hook, code, filename, lineno, offset, options)
+    end
+
     if !isdefined(Base, :JuliaSyntax)
         if vp.ver === VERSION
             return Core._parse
@@ -1005,7 +1048,7 @@ function parser_for_active_project()
     sv = VERSION
     if project !== nothing && isfile(project)
         try
-            sv = project_get_syntax_version(parsed_toml(project))
+            sv = project_get_syntax_version(parsed_toml(project), dirname(project))
         catch e
             @warn "Failed to read project $project - defaulting to latest syntax. err=$e"
         end
@@ -1351,7 +1394,7 @@ function implicit_manifest_uuid_load_spec(dir::String, pkg::PkgId)::Union{Nothin
     end
     proj = project_file_name_uuid(project_file, pkg.name)
     proj == pkg || return nothing
-    return PkgLoadSpec(path, project_get_syntax_version(parsed_toml(project_file)))
+    return PkgLoadSpec(path, project_get_syntax_version(parsed_toml(project_file), dirname(project_file)))
 end
 
 ## other code loading functionality ##
@@ -3391,7 +3434,7 @@ end
 const newly_inferred = []
 
 # this is called in the external process that generates precompiled package files
-function include_package_for_output(pkg::PkgId, input::String, syntax_version::VersionNumber, depot_path::Vector{String}, dl_load_path::Vector{String}, load_path::Vector{String},
+function include_package_for_output(pkg::PkgId, input::String, syntax_version::Union{VersionNumber, String}, depot_path::Vector{String}, dl_load_path::Vector{String}, load_path::Vector{String},
                                     concrete_deps::typeof(_concrete_dependencies), source::Union{Nothing,String})
 
     @lock require_lock begin
@@ -4490,6 +4533,10 @@ end
 
 function cache_syntax_version(ver::VersionNumber)
     UInt8(clamp(ver.minor - 13, 0, 255))
+end
+
+function cache_syntax_version(ver::String)
+    UInt8(_crc32c(Vector{UInt8}(codeunits(abspath(ver)))) % 256)
 end
 
 # This custom equality predicate is analogous to `===`, except that it also

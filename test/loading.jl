@@ -2110,6 +2110,54 @@ module M58272_to end
         copy!(LOAD_PATH, old_load_path)
     end
 
+    old_load_path = copy(LOAD_PATH)
+    try
+        mktempdir() do dir
+            parser_name = "LocalSyntaxHookParser"
+            parser_path = joinpath(dir, parser_name)
+            mkpath(joinpath(parser_path, "src"))
+            write(joinpath(parser_path, "Project.toml"), """
+                name = \"$parser_name\"
+                uuid = \"f2be42b8-8712-4fe4-928b-03f4db9db801\"
+                version = \"0.1.0\"
+                """)
+            write(joinpath(parser_path, "src", "$parser_name.jl"), """
+                module $parser_name
+                const calls = Ref(0)
+                function core_parser_hook(code, filename, lineno, offset, options)
+                    calls[] += 1
+                    Base.JuliaSyntax.core_parser_hook(code, filename, lineno, offset, options; syntax_version=v\"1.14\")
+                end
+                end
+                """)
+
+            pkg_name = "PathSyntaxPkg"
+            pkg_path = joinpath(dir, pkg_name)
+            mkpath(joinpath(pkg_path, "src"))
+            parser_relpath = relpath(parser_path, pkg_path)
+            write(joinpath(pkg_path, "Project.toml"), """
+                name = \"$pkg_name\"
+                uuid = \"7f7ff6ce-321c-4fe2-9489-0076f311dd14\"
+                version = \"0.1.0\"
+
+                [syntax]
+                julia_version = $(repr(parser_relpath))
+                """)
+            write(joinpath(pkg_path, "src", "$pkg_name.jl"), """
+                module $pkg_name
+                x = 1
+                end
+                """)
+
+            push!(LOAD_PATH, pkg_path)
+            Base.require(Main, Symbol(pkg_name))
+            parser_mod = Base.require(Main, Symbol(parser_name))
+            @test parser_mod.calls[] > 0
+        end
+    finally
+        copy!(LOAD_PATH, old_load_path)
+    end
+
     # Test explicit environments (packages loaded from Manifest.toml)
     old_load_path = copy(LOAD_PATH)
     old_active_project = Base.ACTIVE_PROJECT[]
